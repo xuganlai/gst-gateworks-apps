@@ -12,19 +12,19 @@
  */
 
 /**
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU Lesser General Public
- * License as published by the Free Software Foundation; either
- * version 3 of the License, or (at your option) any later version.
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or (at
+ * your option) any later version.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * Lesser General Public License for more details.
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+ * General Public License for more details.
  *
- * You should have received a copy of the GNU Lesser General Public License
- * along with this program; if not, write to the Free Software Foundation,
- * Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+ * You should have received a copy of the GNU General Public License
+ * along with gst-variable-rtsp-server. If not, see
+ * <http://www.gnu.org/licenses/>.
  */
 
 #ifndef VERSION
@@ -43,6 +43,10 @@
 #include <glib.h>
 
 /**
+ * gstreamer rtph264pay:
+ *  - config-interval: SPS and PPS Insertion Interval
+ * h264:
+ *  - idr_interval - interval between IDR frames
  * rtsp-server:
  *  - port: Server port
  *  - mount_point: Server mount point
@@ -52,26 +56,36 @@
  */
 #define DEFAULT_CONFIG_INTERVAL "2"
 #define DEFAULT_IDR_INTERVAL    "0"
-#define DEFAULT_PORT            "9099"
+#define DEFAULT_PORT            "9001"
 #define DEFAULT_MOUNT_POINT     "/stream"
 #define DEFAULT_HOST            "127.0.0.1"
+#define DEFAULT_SRC_ELEMENT     "v4l2src"
+#define STATIC_SINK_PIPELINE			\
+	" imxipuvideotransform name=caps0 !"	\
+	" imxvpuenc_h264 name=enc0 !"		\
+	" rtph264pay name=pay0 pt=96"
 
 /* Default quality 'steps' */
 #define DEFAULT_STEPS "5"
+
+/* max number of chars. in a pipeline */
+#define LAUNCH_MAX 8192
 
 /**
  * imxvpuenc_h264:
  *  - bitrate: Bitrate to use, in kbps
  *             (0 = no bitrate control; constant quality mode is used)
- *
- * v4l2h264enc:
- *  The encoder driver's controls are exposed via V4L2 controls in the
- *  'extra-controls' property. For CODA960 h264 we use the following:
- *  - video_bitrate: Bitrate to use, in kbps
+ *  - quant-param: Constant quantization quality parameter
+ *                 (ignored if bitrate is set to a nonzero value)
+ *                 Please note that '0' is the 'best' quality.
  */
 #define MIN_BR  "0"	     /* The min value "bitrate" to (0 = VBR)*/
 #define MAX_BR  "4294967295" /* Max as defined by imxvpuenc_h264 */
 #define CURR_BR "10000"      /* Default to 10mbit/s */
+
+#define MIN_QUANT_LVL  "0"   /* Minimum quant-param for h264 */
+#define MAX_QUANT_LVL  "51"  /* Maximum quant-param for h264 */
+#define CURR_QUANT_LVL MIN_QUANT_LVL
 
 /**
  * Source and Sink must always be positioned as such. Elements can be added
@@ -88,9 +102,15 @@ struct stream_info {
 	GstRTSPMountPoints *mounts;   /* RTSP Mounts */
 	GstRTSPMediaFactory *factory; /* RTSP Factory */
 	GstRTSPMedia *media;	      /* RTSP Media */
-	GstBin *pipeline;	      /* Array of elements */
+	GstElement **stream;	      /* Array of elements */
 	gboolean connected;	      /* Flag to see if this is in use */
+	gchar *video_in;	      /* Video in device */
+	gint config_interval;	      /* RTP Send Config Interval */
+	gint idr;		      /* Interval betweeen IDR frames */
 	gint steps;		      /* Steps to scale quality at */
+	gint min_quant_lvl;	      /* Min Quant Level */
+	gint max_quant_lvl;	      /* Max Quant Level */
+	gint curr_quant_lvl;	      /* Current Quant Level */
 	gint min_bitrate;	      /* Min Bitrate */
 	gint max_bitrate;	      /* Max Bitrate */
 	gint curr_bitrate;	      /* Current Bitrate */
@@ -114,41 +134,8 @@ void _dbg(const char *func, unsigned int line,
 	}
 }
 
-/*
- * find_element
- * finds an element based on the name
- */
-static gint compare_name(gconstpointer elem, gconstpointer name) {
-
-	const gchar *elem_name = G_OBJECT_TYPE_NAME(g_value_get_object(elem));
-
-	return strstr(g_ascii_strdown(elem_name, -1), (char*) name) ? 0 : 1;
-}
-
-/**
- * search_pipeline
- * Searches the pipeline for a given element
- */
-static GstElement* search_pipeline(GstBin *pipeline, gchar *name) {
-	GstIterator *iter;
-	GValue elem = G_VALUE_INIT;
-	gboolean is_found = FALSE;
-
-	iter = gst_bin_iterate_elements(pipeline);
-	is_found = gst_iterator_find_custom(iter, compare_name, &elem, name);
-	gst_iterator_free(iter);
-
-	if (is_found)
-		return g_value_get_object(&elem);
-
-	return NULL;
-}
-
 static gboolean periodic_msg_handler(struct stream_info *si)
 {
-	GstElement *enc = search_pipeline(si->pipeline, "enc");
-	GstElement *pay = search_pipeline(si->pipeline, "pay");
-	const gchar *name = g_ascii_strdown(G_OBJECT_TYPE_NAME(enc), -1);
 	dbg(4, "called\n");
 
 	if (si->connected == FALSE) {
@@ -160,21 +147,18 @@ static gboolean periodic_msg_handler(struct stream_info *si)
 		GstStructure *stats;
 		g_print("### MSG BLOCK ###\n");
 		g_print("Number of Clients    : %d\n", si->num_cli);
+		g_print("Current Quant Level  : %d\n", si->curr_quant_lvl);
 		g_print("Current Bitrate Level: %d\n", si->curr_bitrate);
-		g_print("Step Factor          : %d\n",
-			(si->max_bitrate - si->min_bitrate) / si->steps);
+		g_print("Step Factor          : %d\n", (si->curr_bitrate) ?
+			((si->max_bitrate - si->min_bitrate) / si->steps) :
+			((si->max_quant_lvl - si->min_quant_lvl) / si->steps));
 
-		g_object_get(pay, "stats", &stats, NULL);
+		g_object_get(G_OBJECT(si->stream[protocol]), "stats", &stats,
+			     NULL);
 		if (stats) {
 			g_print("General RTSP Stats   : %s\n",
 				gst_structure_to_string(stats));
 			gst_structure_free (stats);
-		}
-
-		if (strstr(name, "v4l2h264enc") != NULL) {
-			GstStructure *extra_controls;
-			g_object_get(enc, "extra-controls", &extra_controls, NULL);
-			g_print("extra-controls=%s\n", gst_structure_to_string(extra_controls));
 		}
 
 		g_print("\n");
@@ -184,60 +168,6 @@ static gboolean periodic_msg_handler(struct stream_info *si)
 	}
 
 	return TRUE;
-}
-
-/**
- * setup_encoder
- * Properly Sets up an encoder based on what encoder is being used
- */
-static void setup_encoder(GstElement *enc, const gchar *name,
-			  struct stream_info *si)
-{
-	gchar *str;
-	GstStructure *extra_controls;
-
-	/* setup for specific encoders */
-	if (strstr(name, "imxvpuenc_h264") != NULL) {
-		g_print("Setting encoder bitrate=%d\n", si->curr_bitrate);
-		g_object_set(enc, "bitrate", si->curr_bitrate, NULL);
-	}
-	else if (strstr(name, "v4l2h264enc") != NULL) {
-
-		g_object_get(enc, "extra-controls",
-			     &extra_controls, NULL);
-
-		if (extra_controls == NULL) {
-			str = g_strdup_printf("controls,"
-					      "h264_profile=4,"
-					      "video_bitrate=%d",si->curr_bitrate);
-			extra_controls = gst_structure_from_string(str, NULL);
-			g_free(str);
-		} else {
-			gst_structure_set(extra_controls,
-				  "video_bitrate", G_TYPE_INT, si->curr_bitrate,
-				  "h264_profile", G_TYPE_INT, 4,
-				  NULL);
-		}
-
-		g_print("Setting encoder extra-controls=%s\n",
-		       gst_structure_to_string(extra_controls));
-		g_object_set(enc, "extra-controls",
-			     extra_controls, NULL);
-		gst_structure_free(extra_controls);
-	}
-}
-
-/**
- * setup_elements
- * Called on each element and if necessary hands the element off
- * to be configured
- */
-static void setup_elements(struct stream_info *si)
-{
-	GstElement *elem = NULL;
-
-	if ((elem = search_pipeline(si->pipeline, "enc")) != NULL)
-		setup_encoder(elem, G_OBJECT_TYPE_NAME(elem), si);
 }
 
 /**
@@ -253,14 +183,73 @@ static void media_configure_handler(GstRTSPMediaFactory *factory,
 
 	g_print("[%d]Configuring pipeline...\n", si->num_cli);
 
-	si->pipeline = GST_BIN(gst_rtsp_media_get_element(media));
-	setup_elements(si);
+	si->stream[pipeline] = gst_rtsp_media_get_element(media);
+	si->stream[source] = gst_bin_get_by_name(GST_BIN(si->stream[pipeline]),
+						 "source0");
+	si->stream[caps] = gst_bin_get_by_name(GST_BIN(si->stream[pipeline]),
+					       "caps0");
+	si->stream[encoder] = gst_bin_get_by_name(GST_BIN(si->stream[pipeline]),
+						  "enc0");
+	si->stream[protocol] = gst_bin_get_by_name(
+		GST_BIN(si->stream[pipeline]), "pay0");
+
+	if(!(si->stream[source] &&
+	     si->stream[caps] &&
+	     si->stream[encoder] &&
+	     si->stream[protocol])) {
+		g_printerr("Couldn't get pipeline elements\n");
+		exit(-ECODE_PIPE);
+	}
+
+	/* Modify v4l2src Properties */
+	g_print("Setting input device=%s\n", si->video_in);
+	g_object_set(si->stream[source], "device", si->video_in, NULL);
+
+	/* Modify imxvpuenc_h264 Properties */
+	g_print("Setting encoder bitrate=%d\n", si->curr_bitrate);
+	g_object_set(si->stream[encoder], "bitrate", si->curr_bitrate, NULL);
+	g_print("Setting encoder quant-param=%d\n", si->curr_quant_lvl);
+	g_object_set(si->stream[encoder], "quant-param", si->curr_quant_lvl,
+		     NULL);
+	g_object_set(si->stream[encoder], "idr-interval", si->idr, NULL);
+
+	/* Modify rtph264pay Properties */
+	g_print("Setting rtp config-interval=%d\n",(int) si->config_interval);
+	g_object_set(si->stream[protocol], "config-interval",
+		     si->config_interval, NULL);
 
 	if (si->num_cli == 1) {
 		/* Create Msg Event Handler */
 		dbg(2, "Creating 'periodic message' handler\n");
 		g_timeout_add(si->msg_rate * 1000,
 			      (GSourceFunc)periodic_msg_handler, si);
+	}
+}
+
+/**
+ * change_quant
+ * handle changing of quant-levels
+ */
+static void change_quant(struct stream_info *si)
+{
+	dbg(4, "called\n");
+
+	gint c = si->curr_quant_lvl;
+	int step = (si->max_quant_lvl - si->min_quant_lvl) / si->steps;
+
+	/* Change quantization based on # of clients * step factor */
+	/* It's OK to scale from min since lower val means higher qual */
+	si->curr_quant_lvl = ((si->num_cli - 1) * step) + si->min_quant_lvl;
+
+	/* Cap to max quant level */
+	if (si->curr_quant_lvl > si->max_quant_lvl)
+		si->curr_quant_lvl = si->max_quant_lvl;
+
+	if (si->curr_quant_lvl != c) {
+		g_print("[%d]Changing quant-lvl from %d to %d\n", si->num_cli,
+			c, si->curr_quant_lvl);
+		g_object_set(si->stream[encoder], "quant-param",
+			     si->curr_quant_lvl, NULL);
 	}
 }
 
@@ -274,9 +263,6 @@ static void change_bitrate(struct stream_info *si)
 
 	int c = si->curr_bitrate;
 	int step = (si->max_bitrate - si->min_bitrate) / si->steps;
-	GstElement *elem = search_pipeline(si->pipeline, "enc");
-	const gchar *name = g_ascii_strdown(G_OBJECT_TYPE_NAME(elem), -1);
-	GstStructure *extra_controls;
 
 	/* Change bitrate based on # of clients * step factor */
 	si->curr_bitrate = si->max_bitrate - ((si->num_cli - 1) * step);
@@ -290,19 +276,8 @@ static void change_bitrate(struct stream_info *si)
 	if (si->curr_bitrate != c) {
 		g_print("[%d]Changing bitrate from %d to %d\n", si->num_cli, c,
 			si->curr_bitrate);
-		if (strstr(name, "imxvpuenc_h264") != NULL) {
-			g_object_set(elem, "bitrate",
-				     si->curr_bitrate, NULL);
-		}
-		else if (strstr(name, "v4l2h264enc") != NULL) {
-			g_object_get(elem, "extra-controls",
-				     &extra_controls, NULL);
-			gst_structure_set(extra_controls, "video_bitrate",
-					  G_TYPE_INT, si->curr_bitrate, NULL);
-			g_object_set(elem, "extra-controls",
-				     extra_controls, NULL);
-			gst_structure_free(extra_controls);
-		}
+		g_object_set(si->stream[encoder], "bitrate", si->curr_bitrate,
+			     NULL);
 	}
 }
 
@@ -322,8 +297,25 @@ static void client_close_handler(GstRTSPClient *client, struct stream_info *si)
 		dbg(3, "Connection terminated\n");
 		si->connected = FALSE;
 
+		if (!(si->stream[pipeline] && si->stream[source] &&
+		      si->stream[caps] && si->stream[encoder] &&
+		      si->stream[protocol])) {
+			gst_element_set_state(si->stream[pipeline],
+					      GST_STATE_NULL);
+
+			gst_object_unref(si->stream[source]);
+			gst_object_unref(si->stream[caps]);
+			gst_object_unref(si->stream[encoder]);
+			gst_object_unref(si->stream[protocol]);
+			gst_object_unref(si->stream[pipeline]);
+		}
+		/* Created when first new client connected */
+		free(si->stream);
 	} else {
-		change_bitrate(si);
+		if (si->curr_bitrate)
+			change_bitrate(si);
+		else
+			change_quant(si);
 	}
 }
 
@@ -345,6 +337,8 @@ static void new_client_handler(GstRTSPServer *server, GstRTSPClient *client,
 
 	/* Create media-configure handler */
 	if (si->num_cli == 1) {	/* Initial Setup */
+		/* Free if no more clients (in close handler) */
+		si->stream = malloc(sizeof(GstElement *) * NUM_ELEM);
 
 		/**
 		 * Stream info is required, which is only
@@ -358,7 +352,10 @@ static void new_client_handler(GstRTSPServer *server, GstRTSPClient *client,
 					 si);
 		}
 	} else {
-		change_bitrate(si);
+		if (si->curr_bitrate)
+			change_bitrate(si);
+		else
+			change_quant(si);
 	}
 
 	/* Create new client_close_handler */
@@ -376,7 +373,13 @@ int main (int argc, char *argv[])
 	struct stream_info info = {
 		.num_cli = 0,
 		.connected = FALSE,
+		.video_in = "/dev/video0",
+		.config_interval = atoi(DEFAULT_CONFIG_INTERVAL),
+		.idr = atoi(DEFAULT_IDR_INTERVAL),
 		.steps = atoi(DEFAULT_STEPS) - 1,
+		.min_quant_lvl = atoi(MIN_QUANT_LVL),
+		.max_quant_lvl = atoi(MAX_QUANT_LVL),
+		.curr_quant_lvl = atoi(CURR_QUANT_LVL),
 		.min_bitrate = 1,
 		.max_bitrate = atoi(CURR_BR),
 		.curr_bitrate = atoi(CURR_BR),
@@ -385,7 +388,11 @@ int main (int argc, char *argv[])
 
 	char *port = (char *) DEFAULT_PORT;
 	char *mount_point = (char *) DEFAULT_MOUNT_POINT;
+	char *src_element = (char *) DEFAULT_SRC_ELEMENT;
+	char *caps_filter = NULL;
 	char *user_pipeline = NULL;
+	/* Launch pipeline shouldn't exceed LAUNCH_MAX bytes of characters */
+	char launch[LAUNCH_MAX];
 
 	/* User Arguments */
 	const struct option long_opts[] = {
@@ -394,9 +401,17 @@ int main (int argc, char *argv[])
 		{"debug",            required_argument, 0, 'd'},
 		{"mount-point",      required_argument, 0, 'm'},
 		{"port",             required_argument, 0, 'p'},
-		{"steps",            required_argument, 0, 's'},
+		{"user-pipeline",    required_argument, 0, 'u'},
+		{"src-element",      required_argument, 0, 's'},
+		{"video-in",         required_argument, 0, 'i'},
+		{"caps-filter",      required_argument, 0, 'f'},
+		{"steps",            required_argument, 0,  0 },
 		{"min-bitrate",      required_argument, 0,  0 },
 		{"max-bitrate",      required_argument, 0, 'b'},
+		{"max-quant-lvl",    required_argument, 0,  0 },
+		{"min-quant-lvl",    required_argument, 0, 'l'},
+		{"config-interval",  required_argument, 0, 'c'},
+		{"idr",              required_argument, 0, 'a'},
 		{"msg-rate",         required_argument, 0, 'r'},
 		{ /* Sentinel */ }
 	};
@@ -411,25 +426,39 @@ int main (int argc, char *argv[])
 		" (default: " DEFAULT_MOUNT_POINT ")\n"
 		" --port,            -p - Port to sink on"
 		" (default: " DEFAULT_PORT ")\n"
-		" --steps,           -s - Steps to get to 'worst' quality"
+		" --user-pipeline,   -u - User supplied pipeline. Note the\n"
+		"                         below options are NO LONGER"
+		" applicable.\n"
+		" --src-element,     -s - Gstreamer source element. Must have\n"
+		"                         a 'device' property"
+		" (default: " DEFAULT_SRC_ELEMENT ")\n"
+		" --video-in,        -i - Input Device (default: /dev/video0)\n"
+		" --caps-filter,     -f - Caps filter between src and\n"
+		"                         video transform (default: None)\n"
+		" --steps,              - Steps to get to 'worst' quality"
 		" (default: " DEFAULT_STEPS ")\n"
 		" --max-bitrate,     -b - Max bitrate cap, 0 == VBR"
 		" (default: " CURR_BR ")\n"
 		" --min-bitrate,        - Min bitrate cap"
 		" (default: 1)\n"
+		" --max-quant-lvl,      - Max quant-level cap"
+		" (default: " MAX_QUANT_LVL ")\n"
+		" --min-quant-lvl,   -l - Min quant-level cap"
+		" (default: " MIN_QUANT_LVL ")\n"
+		" --config-interval, -c - Interval to send rtp config"
+		" (default: 2s)\n"
+		" --idr              -a - Interval between IDR Frames"
+		" (default: " DEFAULT_IDR_INTERVAL ")\n"
 		" --msg-rate,        -r - Rate of messages displayed"
 		" (default: 5s)\n\n"
 		"Examples:\n"
-		" - Create RTSP server out of user created pipeline:\n"
-		"\tgst-variable-rtsp-server \"videotestsrc ! v4l2h264enc"
+		" 1. Capture using imxv4l2videosrc, changes quality:\n"
+		"\tgst-variable-rtsp-server -s imxv4l2videosrc\n"
+		"\n"
+		" 2. Create RTSP server out of user created pipeline:\n"
+		"\tgst-variable-rtsp-server -u \"videotestsrc ! imxvpuenc_h264"
 		" ! rtph264pay name=pay0 pt=96\"\n"
 		;
-
-	/* Ensure that there are command arguments */
-	if (argc == 1) {
-		puts(usage);
-		return -ECODE_ARGS;
-	}
 
 	/* Init GStreamer */
 	gst_init(&argc, &argv);
@@ -444,7 +473,11 @@ int main (int argc, char *argv[])
 
 		switch (c) {
 		case 0: /* long-opts only parsing */
-			if (strcmp(long_opts[opt_ndx].name,
+			if (strcmp(long_opts[opt_ndx].name, "steps") == 0) {
+				/* Change steps to internal usage of it */
+				info.steps = atoi(optarg) - 1;
+				dbg(1, "set steps to: %d\n", info.steps);
+			} else if (strcmp(long_opts[opt_ndx].name,
 					"min-bitrate") == 0) {
 				info.min_bitrate = atoi(optarg);
 				if (info.min_bitrate > atoi(MAX_BR)) {
@@ -458,6 +491,25 @@ int main (int argc, char *argv[])
 
 				dbg(1, "set min bitrate to: %d\n",
 				    info.min_bitrate);
+			} else if (strcmp(long_opts[opt_ndx].name,
+					  "max-quant-lvl") == 0) {
+				info.max_quant_lvl = atoi(optarg);
+				if (info.max_quant_lvl > atoi(MAX_QUANT_LVL)) {
+					g_print("Maximum quant-lvl is "
+						MAX_QUANT_LVL
+						".\n");
+					info.max_quant_lvl =
+						atoi(MAX_QUANT_LVL);
+				} else if (info.max_quant_lvl <
+					   atoi(MIN_QUANT_LVL)) {
+					g_print("Minimum quant-lvl is "
+						MIN_QUANT_LVL
+						".\n");
+					info.max_quant_lvl =
+						atoi(MIN_QUANT_LVL);
+				}
+				dbg(1, "set max quant to: %d\n",
+				    info.max_quant_lvl);
 			} else {
 				puts(usage);
 				return -ECODE_ARGS;
@@ -482,9 +534,21 @@ int main (int argc, char *argv[])
 			port = optarg;
 			dbg(1, "set port to: %s\n", port);
 			break;
-		case 's': /* Steps */
-			info.steps = atoi(optarg) - 1;
-			dbg(1, "set steps to: %d\n", info.steps);
+		case 'u': /* User Pipeline*/
+			user_pipeline = optarg;
+			dbg(1, "set user pipeline to: %s\n", user_pipeline);
+			break;
+		case 's': /* Video source element */
+			src_element = optarg;
+			dbg(1, "set source element to: %s\n", src_element);
+			break;
+		case 'i': /* Video in parameter */
+			info.video_in = optarg;
+			dbg(1, "set video in to: %s\n", info.video_in);
+			break;
+		case 'f': /* caps filter */
+			caps_filter = optarg;
+			dbg(1, "set caps filter to: %s\n", caps_filter);
 			break;
 		case 'b': /* Max Bitrate */
 			info.max_bitrate = atoi(optarg);
@@ -499,6 +563,31 @@ int main (int argc, char *argv[])
 			info.curr_bitrate = info.max_bitrate;
 			dbg(1, "set max bitrate to: %d\n", info.max_bitrate);
 			break;
+		case 'l':
+			info.min_quant_lvl = atoi(optarg);
+			if (info.min_quant_lvl > atoi(MAX_QUANT_LVL)) {
+				g_print("Maximum quant-lvl is " MAX_QUANT_LVL
+					".\n");
+				info.min_quant_lvl = atoi(MAX_QUANT_LVL);
+			} else if (info.min_quant_lvl < atoi(MIN_QUANT_LVL)) {
+				g_print("Minimum quant-lvl is " MIN_QUANT_LVL
+					".\n");
+				info.min_quant_lvl = atoi(MIN_QUANT_LVL);
+			}
+
+			info.curr_quant_lvl = info.min_quant_lvl;
+			dbg(1, "set min quant lvl to: %d\n",
+			    info.min_quant_lvl);
+			break;
+		case 'c': /* config-interval */
+			info.config_interval = atoi(optarg);
+			dbg(1, "set rtsp config interval to: %d\n",
+			    info.config_interval);
+			break;
+		case 'a': /* idr frame interval */
+			info.idr = atoi(optarg);
+			dbg(1, "set idr interval to: %d\n", info.idr);
+			break;
 		case 'r': /* how often to display messages at */
 			info.msg_rate = atoi(optarg);
 			dbg(1, "set msg rate to: %d\n", info.msg_rate);
@@ -507,13 +596,15 @@ int main (int argc, char *argv[])
 			puts(usage);
 			return -ECODE_ARGS;
 		}
-
 	}
 
-	/* Grab user pipeline */
-	user_pipeline = argv[argc-1];
-
 	/* Validate inputs */
+	if (info.max_quant_lvl < info.min_quant_lvl) {
+		g_printerr("Max Quant level must be"
+			   "greater than Min Quant level\n");
+		return -ECODE_ARGS;
+	}
+
 	if ((info.max_bitrate + 1) < info.min_bitrate) {
 		g_printerr("Max bitrate must be greater than min bitrate\n");
 		return -ECODE_ARGS;
@@ -524,11 +615,6 @@ int main (int argc, char *argv[])
 		 * we must account for it here when reporting to user
 		 */
 		g_printerr("Steps must be 2 or greater\n");
-		return -ECODE_ARGS;
-	}
-
-	if (strlen(g_strstrip(user_pipeline)) == 0) {
-		g_printerr("A pipeline must be specified\n");
 		return -ECODE_ARGS;
 	}
 
@@ -551,8 +637,16 @@ int main (int argc, char *argv[])
 	gst_rtsp_media_factory_set_shared(info.factory, TRUE);
 
 	/* Source Pipeline */
-	g_print("Pipeline set to: %s\n", user_pipeline);
-	gst_rtsp_media_factory_set_launch(info.factory, user_pipeline);
+	if (user_pipeline)
+		snprintf(launch, LAUNCH_MAX, "( %s )", user_pipeline);
+	else
+		snprintf(launch, LAUNCH_MAX, "%s name=source0 ! %s%s"
+			 STATIC_SINK_PIPELINE,
+			 src_element,
+			 (caps_filter) ? caps_filter : "",
+			 (caps_filter) ? " ! " : "");
+	g_print("Pipeline set to: %s...\n", launch);
+	gst_rtsp_media_factory_set_launch(info.factory, launch);
 
 	/* Connect pipeline to the mount point (URI) */
 	gst_rtsp_mount_points_add_factory(info.mounts, mount_point,
@@ -570,9 +664,11 @@ int main (int argc, char *argv[])
 
 	/* Configure Callbacks */
 	/* Create new client handler (Called on new client connect) */
-	printf("Creating 'client-connected' signal handler\n");
-	g_signal_connect(info.server, "client-connected",
-		         G_CALLBACK(new_client_handler), &info);
+	if (!user_pipeline) {
+		dbg(2, "Creating 'client-connected' signal handler\n");
+		g_signal_connect(info.server, "client-connected",
+				 G_CALLBACK(new_client_handler), &info);
+	}
 
 	/* Run GBLIB main loop until it returns */
 	g_print("Stream ready at rtsp://" DEFAULT_HOST ":%s%s\n",
